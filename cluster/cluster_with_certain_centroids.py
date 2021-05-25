@@ -101,7 +101,7 @@ def cluster_with_certain_centorids(args):
             hidden_size=args.hidden_size
         )
     else:
-        raise ValueError("`{}` is not supported for argument `centroid_source`!".format(centroid_source))
+        raise ValueError("`{}` is not supported for argument `centroid_source`!".format(args.centroid_source))
     centroid_embeddings = torch.from_numpy(centroid_embeddings).to(device)
     # load document cluster embeddings
     cluster_docset = ClusterDocset(args.doc_embedding_dir, args.hidden_size)

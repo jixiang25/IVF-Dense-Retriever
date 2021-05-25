@@ -1,0 +1,267 @@
+import os
+import torch
+import random
+import logging
+import argparse
+import numpy as np
+from tqdm import tqdm
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.tensorboard import SummaryWriter
+
+from transformers import BertConfig, BertTokenizer, AdamW, get_linear_schedule_with_warmup
+
+from model.v1_ivf_dense_retriever import IvfDenseRetriever, MultiLabelCrossEntropyLoss
+from dataset.v1_ivf_dr_trainset import V1IvfDrTrainSet
+from utils.similarity_functions import dot_product, l1_distance, l2_distance
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s-%(levelname)s-%(name)s- %(message)s",
+    datefmt="%d %H:%M:%S",
+    level=logging.INFO
+)
+
+
+def set_seed(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.gpu_count > 0:
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+
+
+def save_model(args, model, update_steps):
+    if not os.path.exists(args.checkpoint_dir):
+        os.makedirs(args.checkpoint_dir)
+    model_to_save = model.module if args.gpu_count > 1 else model
+    save_dir = os.path.join(args.checkpoint_dir, "step-{}".format(update_steps))
+    model_to_save.save_pretrained(save_dir)
+    torch.save(args, os.path.join(save_dir, "args.bin"))
+
+
+def train_epoch(args, model, ranking_criterion, clustering_criterion, optimizer, scheduler, 
+    train_dataloader, writer, update_steps, train_loss, train_ranking_loss, train_clustering_loss, 
+    similarity_func):
+    model.train()
+    device = model.device
+    train_dataloader = tqdm(train_dataloader)
+
+    model.zero_grad()
+    for step, batch in enumerate(train_dataloader):
+        doc_input_ids = batch["doc_input_ids"].to(device)
+        doc_attention_mask = batch["doc_attention_mask"].to(device)
+        query_embeddings = batch["query_embeddings"].to(device)
+        top_centroid_ids = batch["top_centroid_ids"].to(device)
+        labels = batch["labels"].to(device)
+        if args.loss_type == "cross-entropy":
+            labels = labels[:,0]
+
+        centroid_embeddings = model.get_centroid_embeddings()
+        doc_embeddings = model(
+            input_ids=doc_input_ids,
+            attention_mask=doc_attention_mask
+        )
+
+        ranking_score = similarity_func(query_embeddings, doc_embeddings)
+        clustering_score = l2_distance(doc_embeddings, centroid_embeddings)
+
+        ranking_loss = ranking_criterion(ranking_score, labels)
+        clustering_loss = clustering_criterion(clustering_score, top_centroid_ids)
+
+        if args.gpu_count > 1:
+            ranking_loss = ranking_loss.mean()
+            clustering_loss = clustering_loss.mean()
+        if args.gradient_accumulate_steps > 1:
+            ranking_loss = ranking_loss / args.gradient_accumulate_steps
+            clustering_loss = clustering_loss / args.gradient_accumulate_steps
+        loss = ranking_loss + clustering_loss
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+        train_ranking_loss += ranking_loss.item()
+        train_clustering_loss += clustering_loss.item()
+        train_loss += loss.item()
+
+        if (step + 1) % args.gradient_accumulate_steps == 0:
+            optimizer.step()
+            scheduler.step()
+            model.zero_grad()
+
+            update_steps += 1
+            description = "ranking loss:{:.6f} | clustering loss: {:.6f} | loss:{:.6f}".format(
+                train_ranking_loss / update_steps,
+                train_clustering_loss / update_steps,
+                train_loss / update_steps
+            )
+            train_dataloader.set_description(description)
+
+            if args.logging_steps > 0 and update_steps % args.logging_steps == 0:
+                writer.add_scalar('lr', scheduler.get_lr()[0], update_steps)
+                writer.add_scalar('ranking/loss', train_ranking_loss / update_steps, update_steps)
+                writer.add_scalar('clustering/loss', train_clustering_loss / update_steps, update_steps)
+                writer.add_scalar("train/loss", train_loss / update_steps, update_steps)
+            
+            if args.save_steps > 0 and update_steps % args.save_steps == 0:
+                save_model(args, model, update_steps)
+
+
+def train(args):
+    # annotate devices
+    if "cpu" in args.device or not torch.cuda.is_available():
+        device = torch.device("cpu")
+        args.gpu_count = 0
+    else:
+        _, ids = args.device.split(":")
+        device_id_list = [int(idx) for idx in ids.split(",")]
+        device = torch.device("cuda:{}".format(device_id_list[0]))
+        args.gpu_count = len(device_id_list)
+    
+    # init tensorboard writer
+    writer = SummaryWriter(args.logging_dir)
+
+    # set seed
+    set_seed(args)
+
+    # init model
+    config = BertConfig.from_pretrained(args.load_model_path)
+    config.return_dict = False
+    config.repr_normalized = args.repr_normalized
+    if args.repr_type not in ["cls", "avg"]:
+        raise ValueError("Only support `cls` and `avg` for argument `repr_type`!")
+    else:
+        config.repr_type = args.repr_type
+    config.similarity_type = args.similarity_type
+    config.nearest_centroid_num = args.nearest_centroid_num
+    model = IvfDenseRetriever.from_pretrained(args.load_model_path, config=config)
+    model.set_centroid_embedding_layer(args.centroid_embedding_dir, args.cluster_num, config.hidden_size, device)
+    if args.gpu_count > 1:
+        model = torch.nn.DataParallel(model, device_ids=device_id_list)
+    model.to(device)
+
+    # prepare training data
+    train_dataset = V1IvfDrTrainSet(
+        tripplets_and_qrels_dir=args.tripplets_and_qrels_dir,
+        collection_memmap_dir=args.collection_memmap_dir,
+        fixed_query_embeddings_dir=args.fixed_query_embeddings_dir,
+        max_doc_length=args.max_doc_length,
+        hidden_size=config.hidden_size
+    )
+    train_sampler = SequentialSampler(train_dataset)
+    assert int(args.batch_size_per_gpu) % 2 == 0
+    args.batch_size = args.batch_size_per_gpu * max(1, args.gpu_count)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        collate_fn=V1IvfDrTrainSet.collate_func,
+    )
+    total_steps = len(train_dataloader) // args.gradient_accumulate_steps * args.train_epochs
+
+    # init loss
+    if args.loss_type == 'hinge':
+        ranking_criterion = nn.MultiLabelMarginLoss()
+    elif args.loss_type == 'cross-entropy':
+        ranking_criterion = nn.CrossEntropyLoss(reduction='mean')
+    else:
+        raise ValueError('Only support `hinge` and `cross-entropy` for argument `loss_type`!')
+    clustering_criterion = MultiLabelCrossEntropyLoss()
+
+    # init optimizer and scheduler
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], "weight_decay": args.weight_decay},
+        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0}
+    ]
+    optimizer = AdamW(
+        optimizer_grouped_parameters,
+        lr=args.learning_rate,
+        eps=args.adam_epsilon
+    )
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=total_steps
+    )
+
+    # init similarity function
+    if args.similarity_type == "dot-product":
+        similarity_func = dot_product
+    elif args.similarity_type == "L1":
+        similarity_func = l1_distance
+    elif args.similarity_type == "L2":
+        similarity_func = l2_distance
+    else:
+        raise ValueError("Only support `dot-product`, `L1` and `L2` for argument `similarity_type`!")
+    
+    train_ranking_loss, train_clustering_loss, train_loss = 0.0, 0.0, 0.0
+    update_steps = 0
+    for epoch in range(args.train_epochs):
+        logger.info("********Train epoch {}********".format(epoch + 1))
+        train_epoch(
+            args=args,
+            model=model,
+            ranking_criterion=ranking_criterion,
+            clustering_criterion=clustering_criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            train_dataloader=train_dataloader,
+            writer=writer,
+            update_steps=update_steps,
+            train_loss=train_loss,
+            train_ranking_loss=train_ranking_loss,
+            train_clustering_loss=train_clustering_loss,
+            similarity_func=similarity_func
+        )
+        save_model(args, model, "epoch-{}".format(epoch + 1))
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    # data related args
+    parser.add_argument("--collection_memmap_dir", type=str, default="./data/msmarco-passage/collection_memmap/complete")
+    parser.add_argument("--tokenize_dir", type=str, default="./data/msmarco-passage/tokenize")
+    parser.add_argument("--tripplets_and_qrels_dir", type=str, default="./data/msmarco-passage/tripplets_and_qrels")
+    parser.add_argument("--centroid_embedding_dir", type=str, default="./data/msmarco-passage/avg_L2_CE_lr1e-5/centroid_embeddings")
+    parser.add_argument("--fixed_query_embeddings_dir", type=str, default="./data/msmarco-passage/avg_L2_CE_lr1e-5/fixed_query_embeddings")
+    parser.add_argument("--max_query_length", type=int, default=32)
+    parser.add_argument("--max_doc_length", type=int, default=256)
+    # train setting args
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cuda:1")
+    parser.add_argument("--train_epochs", type=int, default=1)
+    parser.add_argument("--gradient_accumulate_steps", type=int, default=2)
+    parser.add_argument("--batch_size_per_gpu", type=int, default=20)
+    parser.add_argument("--learning_rate", type=float, default=3e-6)
+    parser.add_argument("--warmup_steps", type=int, default=10000)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    # model parameters args
+    parser.add_argument("--load_model_path", type=str, default="bert-base-uncased")
+    parser.add_argument("--repr_type", type=str, default="avg", help="choose from cls / avg")
+    parser.add_argument("--repr_normalized", action="store_true")
+    parser.add_argument("--similarity_type", type=str, default="dot-product", help="choose from dot-product / L1 / L2")
+    parser.add_argument("--loss_type", type=str, default='hinge',help='choose from cross-entropy / hinge')
+    parser.add_argument("--cluster_num", type=int, default=1000)
+    parser.add_argument("--nearest_centroid_num", type=int, default=5)
+    # save and logging args
+    parser.add_argument("--checkpoint_dir", type=str, default="./data/msmarco-passage/checkpoints")
+    parser.add_argument("--save_steps", type=int, default=10000)
+    parser.add_argument("--logging_dir", type=str, default="./data/msmarco-passage/log")
+    parser.add_argument("--logging_steps", type=int, default=100)
+    args = parser.parse_args()
+    return args
+
+
+def main():
+    args = get_args()
+    logger.info(args)
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
