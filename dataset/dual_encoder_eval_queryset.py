@@ -6,13 +6,13 @@ from dataset import CollectionDataset, QueryDataset
 
 
 class DualEncoderEvalQuerySet(Dataset):
-    def __init__(self, tokenize_dir, max_query_length):
+    def __init__(self, tokenize_dir, max_query_length, mode="dev"):
         super(DualEncoderEvalQuerySet, self).__init__()
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.cls_id = tokenizer.cls_token_id
         self.sep_id = tokenizer.sep_token_id
         self.max_query_length = max_query_length
-        self.queries = QueryDataset(tokenize_dir, "dev")
+        self.queries = QueryDataset(tokenize_dir, mode)
         self.qids = []
         for qid in self.queries.queries.keys():
             self.qids.append(qid)

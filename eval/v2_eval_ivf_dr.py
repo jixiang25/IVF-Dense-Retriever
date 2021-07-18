@@ -13,7 +13,7 @@ from dataset.dual_encoder_eval_docset import DualEncoderEvalDocSet
 from utils.similarity_functions import dot_product, l1_distance, l2_distance
 from cluster.cluster_with_certain_centroids import get_centroid_embeddings_from_cluster_result
 from model.dual_encoder import DualEncoder
-from model.v1_ivf_dense_retriever import IvfDenseRetriever
+from model.v2_ivf_dense_retriever import IvfDenseRetriever
 from eval import output_retrieved_ranking_result
 
 
@@ -282,7 +282,7 @@ def eval_query_hit_centroid_rate(args):
             qid, pid = int(qid), int(pid)
             if qid not in dev_qrels:
                 dev_qrels[qid] = []
-            dev_qrels.append(pid)
+            dev_qrels[qid].append(pid)
 
     ans_q, ans_p = 0, 0
     # for batch in tqdm(eval_query_dataloader, desc="online inference with IVF", total=total_steps):
@@ -295,7 +295,7 @@ def eval_query_hit_centroid_rate(args):
         centroid_idxs = centroid_idxs.cpu().detach().numpy()
 
         for idx, qid in tqdm(enumerate(qids)):
-            rel_doc_lst = qrels[qid]
+            rel_doc_lst = dev_qrels[qid]
             for rel_doc in rel_doc_lst:
                 ans_p += 1
                 for i in range(args.nearest_centroid_num):
