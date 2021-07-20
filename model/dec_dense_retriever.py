@@ -9,9 +9,9 @@ from model.dual_encoder import _average_sequence_embeddings
 from utils.similarity_functions import l2_distance
 
 
-class IvfDenseRetriever(BertPreTrainedModel):
+class DecDenseRetriever(BertPreTrainedModel):
     def __init__(self, config):
-        super(IvfDenseRetriever, self).__init__(config)
+        super(DecDenseRetriever, self).__init__(config)
         self.bert = BertModel(config)
         self.init_weights()
         self.repr_type = config.repr_type
@@ -48,21 +48,4 @@ class IvfDenseRetriever(BertPreTrainedModel):
         if self.repr_normalized:
             text_embedding = F.normalize(text_embedding, dim=1)
         return text_embedding
-
-
-class MultiLabelCrossEntropyLoss(nn.Module):
-    def __init__(self):
-        super(MultiLabelCrossEntropyLoss, self).__init__()
-
-    def forward(self, input, target):
-        batch_size, centroid_num = input.size()
-        input_exp = torch.exp(input)
-        device = input.device
-
-        mask = torch.zeros((batch_size, centroid_num)).to(device).scatter_(1, target, 1)
-        p = torch.sum(input_exp * mask, dim=-1)
-        q = torch.sum(input_exp, dim=-1)
-
-        loss = torch.sum(torch.log(q) - torch.log(p), dim=-1) / batch_size
-        return loss
         

@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from transformers import BertConfig, BertTokenizer, AdamW, get_linear_schedule_with_warmup
 
-from model.ivf_dense_retriever import IvfDenseRetriever, MultiLabelCrossEntropyLoss
+from model.dec_dense_retriever import DecDenseRetriever
 from dataset.dual_encoder_train_dataset import DualEncoderTrainingSet
 from utils.similarity_functions import dot_product, l1_distance, l2_distance
 
@@ -47,13 +47,13 @@ def t_distribution(doc_embeddings, centroid_embeddings):
     doc_embeddings = doc_embeddings[:,None,:]
     q = torch.sum((doc_embeddings - centroid_embeddings) * (doc_embeddings - centroid_embeddings), dim=-1)
     q = 1 / (1 + q)
-    q = q / q.sum(dim=-1)
+    q = q / q.sum(dim=-1, keepdim=True)
     return q
 
 
 def get_p_from_q(q):
     p = (q * q) / q.sum(dim=0)
-    p = p / p.sum(dim=-1)
+    p = p / p.sum(dim=-1, keepdim=True)
     return p
 
 
@@ -85,12 +85,10 @@ def train_epoch(args, model, ranking_criterion, clustering_criterion, optimizer,
         )
         q = t_distribution(doc_embeddings, centroid_embeddings)
         p = get_p_from_q(q)
-
         ranking_score = similarity_func(query_embeddings, doc_embeddings)
-        
 
         ranking_loss = ranking_criterion(ranking_score, labels)
-        clustering_loss = clustering_criterion(q, torch.log(p))
+        clustering_loss = clustering_criterion(torch.log(q), p)
 
         if args.gpu_count > 1:
             ranking_loss = ranking_loss.mean()
@@ -105,6 +103,9 @@ def train_epoch(args, model, ranking_criterion, clustering_criterion, optimizer,
         train_ranking_loss += ranking_loss.item()
         train_clustering_loss += clustering_loss.item()
         train_loss += loss.item()
+
+        if step == 5:
+            raise ValueError("stop here!")
 
         if (step + 1) % args.gradient_accumulate_steps == 0:
             optimizer.step()
@@ -175,7 +176,7 @@ def train(args):
         config.repr_type = args.repr_type
     config.similarity_type = args.similarity_type
     config.nearest_centroid_num = args.nearest_centroid_num
-    model = IvfDenseRetriever.from_pretrained(args.load_model_path, config=config)
+    model = DecDenseRetriever.from_pretrained(args.load_model_path, config=config)
     model.set_centroid_embedding_layer(args.centroid_embedding_dir, args.cluster_num, config.hidden_size)
     if args.gpu_count > 1:
         model = torch.nn.DataParallel(model, device_ids=device_id_list)
@@ -188,7 +189,7 @@ def train(args):
         ranking_criterion = nn.CrossEntropyLoss(reduction='mean')
     else:
         raise ValueError('Only support `hinge` and `cross-entropy` for argument `loss_type`!')
-    clustering_criterion = KLDivLoss()
+    clustering_criterion = nn.KLDivLoss()
 
     # init optimizer and scheduler
     no_decay = ["bias", "LayerNorm.weight"]
